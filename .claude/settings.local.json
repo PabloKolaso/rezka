@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "mcp__fetch__fetch_readable",
+      "mcp__fetch__fetch_html",
+      "Bash(npm install:*)",
+      "WebFetch(domain:pypi.org)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:rezka.ag)"
+    ]
+  }
+}
