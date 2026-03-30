@@ -10,18 +10,55 @@
 const axios = require('axios');
 const NodeCache = require('node-cache');
 
-const BASE = 'https://rezka.ag';
+const BASE = process.env.REZKA_BASE_URL || 'https://hdrezka.ag';
 
 const cache = new NodeCache({ stdTTL: 3600, checkperiod: 300 });
 
 // Session cookies + content URL saved per content ID — required for AJAX requests
 const sessionStore = new Map(); // contentId → { cookies: string, pageUrl: string }
 
+// Shared browser-like cookies acquired from the homepage pre-warm
+let globalCookies = '';
+
 const HEADERS = {
-  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
   'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
-  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+  'Accept-Encoding': 'gzip, deflate, br',
+  'Cache-Control': 'no-cache',
+  'Pragma': 'no-cache',
+  'Sec-Ch-Ua': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+  'Sec-Ch-Ua-Mobile': '?0',
+  'Sec-Ch-Ua-Platform': '"Windows"',
+  'Sec-Fetch-Dest': 'document',
+  'Sec-Fetch-Mode': 'navigate',
+  'Sec-Fetch-Site': 'none',
+  'Sec-Fetch-User': '?1',
+  'Upgrade-Insecure-Requests': '1',
 };
+
+// ─── Session pre-warm ─────────────────────────────────────────────────────────
+
+/**
+ * Fetch the homepage once on startup to acquire session cookies.
+ * This mimics a real browser visit before any search, reducing 403 probability.
+ */
+async function warmUpHomepage() {
+  try {
+    const response = await axios.get(BASE, { headers: HEADERS, timeout: 15_000 });
+    const setCookie = response.headers['set-cookie'];
+    if (setCookie) {
+      globalCookies = setCookie.map(c => c.split(';')[0]).join('; ');
+      console.log(`[rezka] Homepage pre-warm OK (${BASE}), acquired ${setCookie.length} cookie(s)`);
+    } else {
+      console.log(`[rezka] Homepage pre-warm OK (${BASE}), no cookies set`);
+    }
+  } catch (err) {
+    console.warn(`[rezka] Homepage pre-warm failed (${BASE}): ${err.message} | status: ${err.response?.status || 'N/A'}`);
+  }
+}
+
+warmUpHomepage();
 
 // ─── URL parsing ──────────────────────────────────────────────────────────────
 
@@ -105,7 +142,13 @@ async function search(title) {
   const url = `${BASE}/search/?do=search&subaction=search&q=${encodeURIComponent(title)}`;
   let html;
   try {
-    const { data } = await axios.get(url, { headers: HEADERS, timeout: 10_000 });
+    const searchHeaders = {
+      ...HEADERS,
+      'Referer': `${BASE}/`,
+      'Sec-Fetch-Site': 'same-origin',
+      ...(globalCookies ? { 'Cookie': globalCookies } : {}),
+    };
+    const { data } = await axios.get(url, { headers: searchHeaders, timeout: 10_000 });
     html = data;
   } catch (err) {
     console.warn(`[rezka] Search failed for "${title}": ${err.message} | code: ${err.code || 'N/A'} | status: ${err.response?.status || 'N/A'}`);
@@ -166,7 +209,13 @@ async function getContentInfo(contentUrl) {
 
   let html, responseCookies;
   try {
-    const response = await axios.get(contentUrl, { headers: HEADERS, timeout: 10_000 });
+    const pageHeaders = {
+      ...HEADERS,
+      'Referer': `${BASE}/`,
+      'Sec-Fetch-Site': 'same-origin',
+      ...(globalCookies ? { 'Cookie': globalCookies } : {}),
+    };
+    const response = await axios.get(contentUrl, { headers: pageHeaders, timeout: 10_000 });
     console.log(`[rezka] Content page fetch: status=${response.status} url=${contentUrl}`);
     html = response.data;
     // Save session cookies — required by the AJAX endpoint
@@ -258,13 +307,18 @@ async function refreshSessionCookies(contentId) {
 function buildAjaxHeaders(contentId) {
   const session = sessionStore.get(contentId);
   const referer = session?.pageUrl || `${BASE}/`;
-  const cookies = session?.cookies || '';
+  const sessionCookies = session?.cookies || '';
+  const cookies = [globalCookies, sessionCookies].filter(Boolean).join('; ');
   return {
     'User-Agent': HEADERS['User-Agent'],
     'Accept-Language': HEADERS['Accept-Language'],
     'Accept': 'application/json, text/javascript, */*; q=0.01',
+    'Accept-Encoding': 'gzip, deflate, br',
     'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
     'X-Requested-With': 'XMLHttpRequest',
+    'Sec-Fetch-Dest': 'empty',
+    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Site': 'same-origin',
     'Referer': referer,
     'Origin': BASE,
     ...(cookies ? { 'Cookie': cookies } : {}),
