@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: stremio-rezka-addon
+    runtime: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: PUBLIC_URL
+        generateValue: false
+        sync: false
