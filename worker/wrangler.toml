@@ -1,0 +1,6 @@
+name = "rezka-proxy"
+main = "index.js"
+compatibility_date = "2024-01-01"
+
+# Workers run on Cloudflare's free tier by default.
+# Free tier: 100,000 requests/day — plenty for a personal Stremio addon.

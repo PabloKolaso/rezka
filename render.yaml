@@ -10,3 +10,6 @@ services:
       - key: PUBLIC_URL
         generateValue: false
         sync: false
+      - key: REZKA_BASE_URL
+        generateValue: false
+        sync: false
