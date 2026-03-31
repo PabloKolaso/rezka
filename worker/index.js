@@ -50,8 +50,8 @@ export default {
       });
     }
 
-    // Health check
-    if (url.pathname === '/') {
+    // Health check (separate path so '/' gets proxied to rezka.ag)
+    if (url.pathname === '/_health') {
       return new Response('rezka-proxy OK', { status: 200 });
     }
 
