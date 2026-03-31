@@ -10,7 +10,47 @@
 const axios = require('axios');
 const NodeCache = require('node-cache');
 
-const BASE = process.env.REZKA_BASE_URL || 'https://hdrezka.ag';
+// Mirror list — tried in order when one gets blocked (403).
+// Override via REZKA_MIRRORS env var (comma-separated URLs).
+const MIRRORS = (
+  process.env.REZKA_MIRRORS ||
+  'https://hdrezka.ag,https://hdrezka.me,https://rezka.ag,https://hdrezka.co'
+).split(',').map(s => s.trim()).filter(Boolean);
+
+let activeMirrorIdx = 0;
+
+function getBase() {
+  return MIRRORS[activeMirrorIdx];
+}
+
+/** Rewrite a stored URL's domain to the currently active mirror. */
+function toCurrentMirror(url) {
+  try {
+    const u = new URL(url);
+    const base = new URL(getBase());
+    u.host = base.host;
+    u.protocol = base.protocol;
+    return u.toString();
+  } catch {
+    return url;
+  }
+}
+
+/** Rotate to the next mirror and clear all domain-specific caches. */
+function switchMirror() {
+  const prev = MIRRORS[activeMirrorIdx];
+  activeMirrorIdx = (activeMirrorIdx + 1) % MIRRORS.length;
+  const next = MIRRORS[activeMirrorIdx];
+  console.log(`[rezka] Mirror blocked — switching ${prev} → ${next}`);
+  cache.flushAll();
+  sessionStore.clear();
+  globalCookies = '';
+}
+
+function isBlocked(err) {
+  const s = err.response?.status;
+  return s === 403 || s === 503;
+}
 
 const cache = new NodeCache({ stdTTL: 3600, checkperiod: 300 });
 
@@ -44,17 +84,24 @@ const HEADERS = {
  * This mimics a real browser visit before any search, reducing 403 probability.
  */
 async function warmUpHomepage() {
-  try {
-    const response = await axios.get(BASE, { headers: HEADERS, timeout: 15_000 });
-    const setCookie = response.headers['set-cookie'];
-    if (setCookie) {
-      globalCookies = setCookie.map(c => c.split(';')[0]).join('; ');
-      console.log(`[rezka] Homepage pre-warm OK (${BASE}), acquired ${setCookie.length} cookie(s)`);
-    } else {
-      console.log(`[rezka] Homepage pre-warm OK (${BASE}), no cookies set`);
+  for (let attempt = 0; attempt < MIRRORS.length; attempt++) {
+    const base = getBase();
+    try {
+      const response = await axios.get(base, { headers: HEADERS, timeout: 15_000 });
+      const setCookie = response.headers['set-cookie'];
+      if (setCookie) {
+        globalCookies = setCookie.map(c => c.split(';')[0]).join('; ');
+        console.log(`[rezka] Homepage pre-warm OK (${base}), acquired ${setCookie.length} cookie(s)`);
+      } else {
+        console.log(`[rezka] Homepage pre-warm OK (${base}), no cookies set`);
+      }
+      return;
+    } catch (err) {
+      console.warn(`[rezka] Homepage pre-warm failed (${base}): ${err.message} | status: ${err.response?.status || 'N/A'}`);
+      if (isBlocked(err) && attempt < MIRRORS.length - 1) {
+        switchMirror();
+      }
     }
-  } catch (err) {
-    console.warn(`[rezka] Homepage pre-warm failed (${BASE}): ${err.message} | status: ${err.response?.status || 'N/A'}`);
   }
 }
 
@@ -139,21 +186,31 @@ async function search(title) {
   const cached = cache.get(cacheKey);
   if (cached !== undefined) return cached;
 
-  const url = `${BASE}/search/?do=search&subaction=search&q=${encodeURIComponent(title)}`;
   let html;
-  try {
-    const searchHeaders = {
-      ...HEADERS,
-      'Referer': `${BASE}/`,
-      'Sec-Fetch-Site': 'same-origin',
-      ...(globalCookies ? { 'Cookie': globalCookies } : {}),
-    };
-    const { data } = await axios.get(url, { headers: searchHeaders, timeout: 10_000 });
-    html = data;
-  } catch (err) {
-    console.warn(`[rezka] Search failed for "${title}": ${err.message} | code: ${err.code || 'N/A'} | status: ${err.response?.status || 'N/A'}`);
-    return [];
+  for (let attempt = 0; attempt < MIRRORS.length; attempt++) {
+    const base = getBase();
+    const url = `${base}/search/?do=search&subaction=search&q=${encodeURIComponent(title)}`;
+    try {
+      const searchHeaders = {
+        ...HEADERS,
+        'Referer': `${base}/`,
+        'Sec-Fetch-Site': 'same-origin',
+        ...(globalCookies ? { 'Cookie': globalCookies } : {}),
+      };
+      const { data } = await axios.get(url, { headers: searchHeaders, timeout: 10_000 });
+      html = data;
+      break;
+    } catch (err) {
+      if (isBlocked(err) && attempt < MIRRORS.length - 1) {
+        switchMirror();
+        await warmUpHomepage();
+        continue;
+      }
+      console.warn(`[rezka] Search failed for "${title}": ${err.message} | code: ${err.code || 'N/A'} | status: ${err.response?.status || 'N/A'}`);
+      return [];
+    }
   }
+  if (!html) return [];
 
   const results = [];
 
@@ -203,32 +260,43 @@ async function search(title) {
  * @returns {Promise<{ id: string, translators: Array<{ id: string, name: string, isPremium: boolean }> }|null>}
  */
 async function getContentInfo(contentUrl) {
+  contentUrl = toCurrentMirror(contentUrl);
   const cacheKey = `info:${contentUrl}`;
   const cached = cache.get(cacheKey);
   if (cached !== undefined) return cached;
 
   let html, responseCookies;
-  try {
-    const pageHeaders = {
-      ...HEADERS,
-      'Referer': `${BASE}/`,
-      'Sec-Fetch-Site': 'same-origin',
-      ...(globalCookies ? { 'Cookie': globalCookies } : {}),
-    };
-    const response = await axios.get(contentUrl, { headers: pageHeaders, timeout: 10_000 });
-    console.log(`[rezka] Content page fetch: status=${response.status} url=${contentUrl}`);
-    html = response.data;
-    // Save session cookies — required by the AJAX endpoint
-    const setCookie = response.headers['set-cookie'];
-    if (setCookie) {
-      responseCookies = setCookie.map(c => c.split(';')[0]).join('; ');
-    } else {
-      console.warn(`[rezka] No Set-Cookie header from content page — AJAX requests may fail (url=${contentUrl})`);
+  for (let attempt = 0; attempt < MIRRORS.length; attempt++) {
+    const base = getBase();
+    const mirroredUrl = toCurrentMirror(contentUrl);
+    try {
+      const pageHeaders = {
+        ...HEADERS,
+        'Referer': `${base}/`,
+        'Sec-Fetch-Site': 'same-origin',
+        ...(globalCookies ? { 'Cookie': globalCookies } : {}),
+      };
+      const response = await axios.get(mirroredUrl, { headers: pageHeaders, timeout: 10_000 });
+      console.log(`[rezka] Content page fetch: status=${response.status} url=${mirroredUrl}`);
+      html = response.data;
+      const setCookie = response.headers['set-cookie'];
+      if (setCookie) {
+        responseCookies = setCookie.map(c => c.split(';')[0]).join('; ');
+      } else {
+        console.warn(`[rezka] No Set-Cookie header from content page — AJAX requests may fail (url=${mirroredUrl})`);
+      }
+      break;
+    } catch (err) {
+      if (isBlocked(err) && attempt < MIRRORS.length - 1) {
+        switchMirror();
+        await warmUpHomepage();
+        continue;
+      }
+      console.error(`[rezka] Content page fetch failed for ${mirroredUrl}: ${err.message} | code: ${err.code || 'N/A'} | status: ${err.response?.status || 'N/A'}`);
+      return null;
     }
-  } catch (err) {
-    console.error(`[rezka] Content page fetch failed for ${contentUrl}: ${err.message} | code: ${err.code || 'N/A'} | status: ${err.response?.status || 'N/A'}`);
-    return null;
   }
+  if (!html) return null;
 
   // Extract internal content ID
   const idMatch = html.match(/initCDNSeriesEvents\((\d+),/)
@@ -306,7 +374,7 @@ async function refreshSessionCookies(contentId) {
 
 function buildAjaxHeaders(contentId) {
   const session = sessionStore.get(contentId);
-  const referer = session?.pageUrl || `${BASE}/`;
+  const referer = (session?.pageUrl ? toCurrentMirror(session.pageUrl) : null) || `${getBase()}/`;
   const sessionCookies = session?.cookies || '';
   const cookies = [globalCookies, sessionCookies].filter(Boolean).join('; ');
   return {
@@ -320,7 +388,7 @@ function buildAjaxHeaders(contentId) {
     'Sec-Fetch-Mode': 'cors',
     'Sec-Fetch-Site': 'same-origin',
     'Referer': referer,
-    'Origin': BASE,
+    'Origin': getBase(),
     ...(cookies ? { 'Cookie': cookies } : {}),
   };
 }
@@ -351,7 +419,7 @@ async function warmUpSeason(contentId, translatorId, season) {
       action: 'get_episodes',
     });
     const response = await axios.post(
-      `${BASE}/ajax/get_cdn_series/?t=${Date.now()}`,
+      `${getBase()}/ajax/get_cdn_series/?t=${Date.now()}`,
       params.toString(),
       { headers: buildAjaxHeaders(contentId), timeout: 10_000 }
     );
@@ -402,7 +470,7 @@ async function getSeriesStreams(contentId, translatorId, season, episode) {
     });
 
     let { data } = await axios.post(
-      `${BASE}/ajax/get_cdn_series/?t=${Date.now()}`,
+      `${getBase()}/ajax/get_cdn_series/?t=${Date.now()}`,
       params.toString(),
       { headers: buildAjaxHeaders(contentId), timeout: 10_000 }
     );
@@ -428,7 +496,7 @@ async function getSeriesStreams(contentId, translatorId, season, episode) {
         action: 'get_stream',
       });
       ({ data } = await axios.post(
-        `${BASE}/ajax/get_cdn_series/?t=${Date.now()}`,
+        `${getBase()}/ajax/get_cdn_series/?t=${Date.now()}`,
         retryParams.toString(),
         { headers: buildAjaxHeaders(contentId), timeout: 10_000 }
       ));
@@ -448,6 +516,7 @@ async function getSeriesStreams(contentId, translatorId, season, episode) {
     cache.set(cacheKey, qualities, 900);
     return qualities;
   } catch (err) {
+    if (isBlocked(err)) switchMirror();
     console.warn(`[rezka] Series stream failed (id=${contentId} tr=${translatorId} s${season}e${episode}): ${err.message} | code: ${err.code || 'N/A'} | status: ${err.response?.status || 'N/A'}`);
     return null;
   }
@@ -471,7 +540,7 @@ async function getMovieStreams(contentId, translatorId) {
     });
 
     let { data } = await axios.post(
-      `${BASE}/ajax/get_cdn_series/?t=${Date.now()}`,
+      `${getBase()}/ajax/get_cdn_series/?t=${Date.now()}`,
       params.toString(),
       { headers: buildAjaxHeaders(contentId), timeout: 10_000 }
     );
@@ -493,7 +562,7 @@ async function getMovieStreams(contentId, translatorId) {
         action: 'get_movie',
       });
       ({ data } = await axios.post(
-        `${BASE}/ajax/get_cdn_series/?t=${Date.now()}`,
+        `${getBase()}/ajax/get_cdn_series/?t=${Date.now()}`,
         retryParams.toString(),
         { headers: buildAjaxHeaders(contentId), timeout: 10_000 }
       ));
@@ -513,6 +582,7 @@ async function getMovieStreams(contentId, translatorId) {
     cache.set(cacheKey, qualities, 900);
     return qualities;
   } catch (err) {
+    if (isBlocked(err)) switchMirror();
     console.warn(`[rezka] Movie stream failed (id=${contentId} tr=${translatorId}): ${err.message} | code: ${err.code || 'N/A'} | status: ${err.response?.status || 'N/A'}`);
     return null;
   }
